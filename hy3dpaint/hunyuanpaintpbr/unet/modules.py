@@ -15,6 +15,7 @@
 import os
 import json
 import copy
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -48,8 +49,49 @@ class Dino_v2(nn.Module):
 
     def __init__(self, dino_v2_path):
         super(Dino_v2, self).__init__()
-        self.dino_processor = AutoImageProcessor.from_pretrained(dino_v2_path)
-        self.dino_v2 = AutoModel.from_pretrained(dino_v2_path)
+        allow_downloads = os.getenv("HUNYUAN_HF_ALLOW_DOWNLOADS", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+        local_files_only = not allow_downloads
+
+        def _host_mem_summary() -> str:
+            try:
+                import psutil
+
+                vm = psutil.virtual_memory()
+                rss = int(psutil.Process(os.getpid()).memory_info().rss)
+                return (
+                    f"host_rss={rss / 1024**3:.2f}GiB "
+                    f"host_free={int(vm.available) / 1024**3:.2f}GiB "
+                    f"host_total={int(vm.total) / 1024**3:.2f}GiB"
+                )
+            except Exception:
+                return "host=unknown"
+
+        def _log(message: str) -> None:
+            if os.getenv("HUNYUAN_MEMORY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+                print(f"[hunyuan-paint] {message} {_host_mem_summary()}", flush=True)
+
+        _log(f"Dino_v2 load start repo={dino_v2_path} local_files_only={local_files_only}")
+        start = time.monotonic()
+        try:
+            self.dino_processor = AutoImageProcessor.from_pretrained(dino_v2_path, local_files_only=local_files_only)
+        except TypeError:
+            self.dino_processor = AutoImageProcessor.from_pretrained(dino_v2_path)
+
+        model_kwargs = {
+            "local_files_only": local_files_only,
+            "torch_dtype": torch.float16,
+            "low_cpu_mem_usage": True,
+        }
+        try:
+            self.dino_v2 = AutoModel.from_pretrained(dino_v2_path, **model_kwargs)
+        except TypeError:
+            model_kwargs.pop("low_cpu_mem_usage", None)
+            model_kwargs.pop("torch_dtype", None)
+            try:
+                self.dino_v2 = AutoModel.from_pretrained(dino_v2_path, **model_kwargs)
+            except TypeError:
+                self.dino_v2 = AutoModel.from_pretrained(dino_v2_path)
+        _log(f"Dino_v2 load done elapsed={time.monotonic() - start:.1f}s")
 
         for param in self.parameters():
             param.requires_grad = False
@@ -808,13 +850,46 @@ class UNet2p5DConditionModel(torch.nn.Module):
 
     @staticmethod
     def from_pretrained(pretrained_model_name_or_path, **kwargs):
+        def _host_mem_summary() -> str:
+            try:
+                import psutil
+
+                vm = psutil.virtual_memory()
+                rss = int(psutil.Process(os.getpid()).memory_info().rss)
+                return (
+                    f"host_rss={rss / 1024**3:.2f}GiB "
+                    f"host_free={int(vm.available) / 1024**3:.2f}GiB "
+                    f"host_total={int(vm.total) / 1024**3:.2f}GiB"
+                )
+            except Exception:
+                return "host=unknown"
+
+        def _log(message: str) -> None:
+            if os.getenv("HUNYUAN_MEMORY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+                print(f"[hunyuan-paint] {message} {_host_mem_summary()}", flush=True)
+
+        start = time.monotonic()
+        _log(f"UNet2p5DConditionModel.from_pretrained start path={pretrained_model_name_or_path}")
         torch_dtype = kwargs.pop("torch_dtype", torch.float32)
         config_path = os.path.join(pretrained_model_name_or_path, "config.json")
         unet_ckpt_path = os.path.join(pretrained_model_name_or_path, "diffusion_pytorch_model.bin")
         with open(config_path, "r", encoding="utf-8") as file:
             config = json.load(file)
-        unet = UNet2DConditionModel(**config)
-        unet_2p5d = UNet2p5DConditionModel(unet)
+        try:
+            from accelerate import init_empty_weights
+        except Exception:
+            init_empty_weights = None
+
+        if init_empty_weights is None:
+            unet = UNet2DConditionModel(**config)
+            unet_2p5d = UNet2p5DConditionModel(unet)
+        else:
+            # Avoid large peak RSS by instantiating on meta tensors and assigning
+            # checkpoint weights directly into module parameters.
+            with init_empty_weights():
+                unet = UNet2DConditionModel(**config)
+                unet_2p5d = UNet2p5DConditionModel(unet)
+
         unet_2p5d.unet.conv_in = torch.nn.Conv2d(
             12,
             unet.conv_in.out_channels,
@@ -825,9 +900,26 @@ class UNet2p5DConditionModel(torch.nn.Module):
             groups=unet.conv_in.groups,
             bias=unet.conv_in.bias is not None,
         )
-        unet_ckpt = torch.load(unet_ckpt_path, map_location="cpu", weights_only=True)
-        unet_2p5d.load_state_dict(unet_ckpt, strict=True)
+
+        load_kwargs = {"map_location": "cpu", "weights_only": True}
+        try:
+            load_kwargs["mmap"] = True
+            unet_ckpt = torch.load(unet_ckpt_path, **load_kwargs)
+        except TypeError:
+            load_kwargs.pop("mmap", None)
+            unet_ckpt = torch.load(unet_ckpt_path, **load_kwargs)
+
+        try:
+            unet_2p5d.load_state_dict(unet_ckpt, strict=True, assign=True)
+        except TypeError:
+            try:
+                unet_2p5d.to_empty(device="cpu")
+            except Exception:
+                unet_2p5d = unet_2p5d.to("cpu")
+            unet_2p5d.load_state_dict(unet_ckpt, strict=True)
+
         unet_2p5d = unet_2p5d.to(torch_dtype)
+        _log(f"UNet2p5DConditionModel.from_pretrained done elapsed={time.monotonic() - start:.1f}s")
         return unet_2p5d
 
     def init_condition(self, use_dino):
