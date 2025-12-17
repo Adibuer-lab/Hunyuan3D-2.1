@@ -165,15 +165,39 @@ class Hunyuan3DDiTPipeline:
                     ckpt[model_name] = {}
                 ckpt[model_name][new_key] = value
         else:
-            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+            # Use mmap to reduce peak RSS while materializing large checkpoints.
+            try:
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True, mmap=True)
+            except TypeError:
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+            except RuntimeError as exc:
+                if 'mmap' not in str(exc).lower():
+                    raise
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
         # load model
-        model = instantiate_from_config(config['model'])
-        model.load_state_dict(ckpt['model'])
-        vae = instantiate_from_config(config['vae'])
-        vae.load_state_dict(ckpt['vae'], strict=False)
-        conditioner = instantiate_from_config(config['conditioner'])
+        prev_default_dtype = torch.get_default_dtype()
+        if dtype is not None:
+            torch.set_default_dtype(dtype)
+        try:
+            model = instantiate_from_config(config['model'])
+            vae = instantiate_from_config(config['vae'])
+            conditioner = instantiate_from_config(config['conditioner'])
+        finally:
+            torch.set_default_dtype(prev_default_dtype)
+
+        try:
+            model.load_state_dict(ckpt['model'], assign=True)
+        except TypeError:
+            model.load_state_dict(ckpt['model'])
+        try:
+            vae.load_state_dict(ckpt['vae'], strict=False, assign=True)
+        except TypeError:
+            vae.load_state_dict(ckpt['vae'], strict=False)
         if 'conditioner' in ckpt:
-            conditioner.load_state_dict(ckpt['conditioner'])
+            try:
+                conditioner.load_state_dict(ckpt['conditioner'], assign=True)
+            except TypeError:
+                conditioner.load_state_dict(ckpt['conditioner'])
         image_processor = instantiate_from_config(config['image_processor'])
         scheduler = instantiate_from_config(config['scheduler'])
 
@@ -242,6 +266,15 @@ class Hunyuan3DDiTPipeline:
         self.scheduler = scheduler
         self.conditioner = conditioner
         self.image_processor = image_processor
+        # Diffusers-style helper used by CPU offload utilities and execution-device inference.
+        # Keep keys aligned with `model_cpu_offload_seq`.
+        self.components = {
+            "vae": self.vae,
+            "model": self.model,
+            "scheduler": self.scheduler,
+            "conditioner": self.conditioner,
+            "image_processor": self.image_processor,
+        }
         self.kwargs = kwargs
         self.to(device, dtype)
 

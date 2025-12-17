@@ -143,13 +143,31 @@ class VectsetVAE(nn.Module):
             import safetensors.torch
             ckpt = safetensors.torch.load_file(ckpt_path, device='cpu')
         else:
-            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+            # Use mmap to reduce peak RSS while materializing large checkpoints.
+            try:
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True, mmap=True)
+            except TypeError:
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+            except RuntimeError as exc:
+                if 'mmap' not in str(exc).lower():
+                    raise
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
 
         model_kwargs = config['params']
         model_kwargs.update(kwargs)
 
-        model = cls(**model_kwargs)
-        model.load_state_dict(ckpt)
+        prev_default_dtype = torch.get_default_dtype()
+        if dtype is not None:
+            torch.set_default_dtype(dtype)
+        try:
+            model = cls(**model_kwargs)
+        finally:
+            torch.set_default_dtype(prev_default_dtype)
+
+        try:
+            model.load_state_dict(ckpt, assign=True)
+        except TypeError:
+            model.load_state_dict(ckpt)
         model.to(device=device, dtype=dtype)
         return model
 
