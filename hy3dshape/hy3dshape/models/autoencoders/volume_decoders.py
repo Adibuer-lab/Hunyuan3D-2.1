@@ -138,6 +138,39 @@ def generate_dense_grid_points(
     return xyz, grid_size, length
 
 
+def iter_dense_grid_points(
+    *,
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+    octree_resolution: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    chunk_size: int,
+    indexing: str = "ij",
+):
+    if indexing != "ij":
+        raise ValueError(f"Unsupported indexing {indexing!r}; expected 'ij'")
+    grid_dim = int(octree_resolution) + 1
+    if grid_dim <= 0:
+        raise ValueError(f"Invalid octree_resolution={octree_resolution}; expected >= 0")
+    total_points = grid_dim * grid_dim * grid_dim
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+
+    x = torch.linspace(float(bbox_min[0]), float(bbox_max[0]), grid_dim, device=device, dtype=dtype)
+    y = torch.linspace(float(bbox_min[1]), float(bbox_max[1]), grid_dim, device=device, dtype=dtype)
+    z = torch.linspace(float(bbox_min[2]), float(bbox_max[2]), grid_dim, device=device, dtype=dtype)
+
+    stride_yz = grid_dim * grid_dim
+    for start in range(0, total_points, chunk_size):
+        end = min(start + chunk_size, total_points)
+        idx = torch.arange(start, end, device=device, dtype=torch.int64)
+        idx_x = idx // stride_yz
+        idx_y = (idx // grid_dim) % grid_dim
+        idx_z = idx % grid_dim
+        yield torch.stack((x[idx_x], y[idx_y], z[idx_z]), dim=-1)
+
+
 class VanillaVolumeDecoder:
     @torch.no_grad()
     def __call__(
@@ -159,24 +192,34 @@ class VanillaVolumeDecoder:
             bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]
 
         bbox_min, bbox_max = np.array(bounds[0:3]), np.array(bounds[3:6])
-        xyz_samples, grid_size, length = generate_dense_grid_points(
-            bbox_min=bbox_min,
-            bbox_max=bbox_max,
-            octree_resolution=octree_resolution,
-            indexing="ij"
-        )
-        xyz_samples = torch.from_numpy(xyz_samples).to(device, dtype=dtype).contiguous().reshape(-1, 3)
+        grid_dim = int(octree_resolution) + 1
+        total_points = grid_dim * grid_dim * grid_dim
+        grid_size = [grid_dim, grid_dim, grid_dim]
+        grid_logits = torch.empty((batch_size, total_points, 1), device=device, dtype=dtype)
 
         # 2. latents to 3d volume
-        batch_logits = []
-        for start in tqdm(range(0, xyz_samples.shape[0], num_chunks), desc=f"Volume Decoding",
-                          disable=not enable_pbar):
-            chunk_queries = xyz_samples[start: start + num_chunks, :]
+        for start, chunk_queries in zip(
+            range(0, total_points, num_chunks),
+            tqdm(
+                iter_dense_grid_points(
+                    bbox_min=bbox_min,
+                    bbox_max=bbox_max,
+                    octree_resolution=octree_resolution,
+                    device=device,
+                    dtype=dtype,
+                    chunk_size=num_chunks,
+                    indexing="ij",
+                ),
+                desc="Volume Decoding",
+                disable=not enable_pbar,
+                total=(total_points + num_chunks - 1) // num_chunks,
+            ),
+        ):
+            end = min(start + num_chunks, total_points)
             chunk_queries = repeat(chunk_queries, "p c -> b p c", b=batch_size)
             logits = geo_decoder(queries=chunk_queries, latents=latents)
-            batch_logits.append(logits)
+            grid_logits[:, start:end, :] = logits
 
-        grid_logits = torch.cat(batch_logits, dim=1)
         grid_logits = grid_logits.view((batch_size, *grid_size)).float()
 
         return grid_logits

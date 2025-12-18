@@ -18,19 +18,13 @@ import numpy as np
 import torch
 from skimage import measure
 
+from ...utils import logger
+
 
 class Latent2MeshOutput:
     def __init__(self, mesh_v=None, mesh_f=None):
         self.mesh_v = mesh_v
         self.mesh_f = mesh_f
-
-
-def center_vertices(vertices):
-    """Translate the vertices so that bounding box is centered at zero."""
-    vert_min = vertices.min(dim=0)[0]
-    vert_max = vertices.max(dim=0)[0]
-    vert_center = 0.5 * (vert_min + vert_max)
-    return vertices - vert_center
 
 
 class SurfaceExtractor:
@@ -82,18 +76,15 @@ class SurfaceExtractor:
             List[Optional[Latent2MeshOutput]]: List of mesh outputs for each grid in the batch.
                 If extraction fails for a grid, None is appended at that position.
         """
-        outputs = []
+        outputs: List[Latent2MeshOutput] = []
         for i in range(grid_logits.shape[0]):
             try:
                 vertices, faces = self.run(grid_logits[i], **kwargs)
-                vertices = vertices.astype(np.float32)
-                faces = np.ascontiguousarray(faces)
-                outputs.append(Latent2MeshOutput(mesh_v=vertices, mesh_f=faces))
-
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                outputs.append(None)
+            except Exception as exc:
+                raise RuntimeError(f"Surface extraction failed for batch index {i}") from exc
+            vertices = vertices.astype(np.float32)
+            faces = np.ascontiguousarray(faces)
+            outputs.append(Latent2MeshOutput(mesh_v=vertices, mesh_f=faces))
 
         return outputs
 
@@ -125,36 +116,109 @@ class MCSurfaceExtractor(SurfaceExtractor):
 
 
 class DMCSurfaceExtractor(SurfaceExtractor):
-    def run(self, grid_logit, *, octree_resolution, **kwargs):
+    def __init__(self):
+        super().__init__()
+        self.allow_fallback_to_mc = False
+
+    def run(self, grid_logit, *, mc_level, bounds, octree_resolution, method: str = "nagae", **kwargs):
         """
-        Extract surface mesh using Differentiable Marching Cubes (DMC) algorithm.
+        Extract surface mesh on GPU via isoext's CUDA marching cubes implementation.
+
+        Note: This is not a differentiable path in our inference service; we only require
+        a fast, GPU-resident isosurface extraction to avoid the CPU+host-RAM spike caused by
+        `skimage.measure.marching_cubes(...)`.
 
         Args:
             grid_logit (torch.Tensor): 3D grid logits tensor representing the scalar field.
+            mc_level (float): The level (iso-value) at which to extract the surface.
+            bounds (Union[Tuple[float], List[float], float]): Bounding box coordinates or half side length.
             octree_resolution (int): Resolution of the octree grid.
+            method (str): isoext marching cubes method name (default: "nagae").
             **kwargs: Additional keyword arguments (ignored).
 
         Returns:
             Tuple[np.ndarray, np.ndarray]: Tuple containing:
-                - vertices (np.ndarray): Extracted mesh vertices, centered and converted to numpy.
-                - faces (np.ndarray): Extracted mesh faces (triangles), with reversed vertex order.
+                - vertices (np.ndarray): Extracted mesh vertices (bounding box coordinates).
+                - faces (np.ndarray): Extracted mesh faces (triangles).
         
         Raises:
-            ImportError: If the 'diso' package is not installed.
+            ImportError: If the 'isoext' package is not installed.
         """
         device = grid_logit.device
-        if not hasattr(self, 'dmc'):
+        if device.type != "cuda":
+            if self.allow_fallback_to_mc:
+                logger.warning("GPU marching-cubes requires CUDA. Falling back to CPU marching-cubes.")
+                return MCSurfaceExtractor().run(
+                    grid_logit,
+                    mc_level=mc_level,
+                    bounds=bounds,
+                    octree_resolution=octree_resolution,
+                )
+            raise RuntimeError("GPU marching-cubes requires CUDA. Set mc_algo to 'mc' or run on a CUDA device.")
+
+        if not hasattr(self, "_isoext"):
             try:
-                from diso import DiffDMC
-                self.dmc = DiffDMC(dtype=torch.float32).to(device)
-            except:
-                raise ImportError("Please install diso via `pip install diso`, or set mc_algo to 'mc'")
-        sdf = -grid_logit / octree_resolution
-        sdf = sdf.to(torch.float32).contiguous()
-        verts, faces = self.dmc(sdf, deform=None, return_quads=False, normalize=True)
-        verts = center_vertices(verts)
+                import isoext
+
+                self._isoext = isoext
+            except Exception as exc:
+                if self.allow_fallback_to_mc:
+                    logger.warning(
+                        "GPU marching-cubes unavailable (failed to import isoext). Falling back to CPU marching-cubes."
+                    )
+                    return MCSurfaceExtractor().run(
+                        grid_logit,
+                        mc_level=mc_level,
+                        bounds=bounds,
+                        octree_resolution=octree_resolution,
+                    )
+                raise ImportError("Please install isoext via `pip install isoext`, or set mc_algo to 'mc'") from exc
+
+        isoext = self._isoext
+
+        grid_size, bbox_min, bbox_size = self._compute_box_stat(bounds, octree_resolution)
+        bbox_max = bbox_min + bbox_size
+
+        values = grid_logit
+        if values.dtype != torch.float32:
+            values = values.to(dtype=torch.float32)
+        values = values.contiguous()
+        nan_sentinel = float(torch.finfo(torch.float32).max)
+        values = torch.nan_to_num(values, nan=nan_sentinel, posinf=nan_sentinel, neginf=-nan_sentinel)
+        try:
+            grid = isoext.UniformGrid(
+                grid_size,
+                aabb_min=bbox_min.astype(np.float32).tolist(),
+                aabb_max=bbox_max.astype(np.float32).tolist(),
+                default_value=nan_sentinel,
+            )
+            grid.set_values(values)
+            verts, faces = isoext.marching_cubes(grid, level=float(mc_level), method=str(method))
+        except torch.cuda.OutOfMemoryError:
+            if not self.allow_fallback_to_mc:
+                raise
+            logger.warning("GPU marching-cubes hit CUDA OOM. Falling back to CPU marching-cubes.")
+            torch.cuda.empty_cache()
+            return MCSurfaceExtractor().run(
+                grid_logit,
+                mc_level=mc_level,
+                bounds=bounds,
+                octree_resolution=octree_resolution,
+            )
+        except RuntimeError as exc:
+            if (not self.allow_fallback_to_mc) or ("out of memory" not in str(exc).lower()):
+                raise
+            logger.warning("GPU marching-cubes hit CUDA OOM. Falling back to CPU marching-cubes.")
+            torch.cuda.empty_cache()
+            return MCSurfaceExtractor().run(
+                grid_logit,
+                mc_level=mc_level,
+                bounds=bounds,
+                octree_resolution=octree_resolution,
+            )
+
         vertices = verts.detach().cpu().numpy()
-        faces = faces.detach().cpu().numpy()[:, ::-1]
+        faces = faces.detach().cpu().numpy()
         return vertices, faces
 
 
