@@ -19,7 +19,7 @@ import torch
 import random
 import numpy as np
 from PIL import Image
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import huggingface_hub
 from omegaconf import OmegaConf
 from diffusers import DiffusionPipeline
@@ -98,7 +98,7 @@ class multiviewDiffusionNet:
 
             return reserve_frac, reserve_floor_bytes
 
-        def _gpu_headroom_bytes() -> Optional[Tuple[int, int, int]]:
+        def _gpu_headroom_bytes() -> Optional[Tuple[int, int, int, int]]:
             if not torch.cuda.is_available():
                 return None
             try:
@@ -120,7 +120,7 @@ class multiviewDiffusionNet:
             reserve_frac, reserve_floor_bytes = _read_gpu_reserve_bytes()
             reserve_target_bytes = max(int(total_bytes * reserve_frac), reserve_floor_bytes)
             headroom_bytes = max(0, int(free_bytes) - reserve_target_bytes)
-            return int(total_bytes), int(free_bytes), int(headroom_bytes)
+            return int(device_index), int(total_bytes), int(free_bytes), int(headroom_bytes)
 
         def _ensure_offload_dir() -> Optional[str]:
             if not enable_disk_offload:
@@ -202,7 +202,7 @@ class multiviewDiffusionNet:
                 return 50
             return 10
 
-        def _plan_device_map(model_root: str) -> Optional[Dict[str, str]]:
+        def _plan_device_map(model_root: str) -> Optional[Tuple[str, Dict[Union[int, str], int]]]:
             if not enable_device_map:
                 return None
             if not torch.cuda.is_available():
@@ -213,28 +213,25 @@ class multiviewDiffusionNet:
             gpu_state = _gpu_headroom_bytes()
             if gpu_state is None:
                 return None
-            total_bytes, free_bytes, headroom_bytes = gpu_state
+            device_index, total_bytes, free_bytes, headroom_bytes = gpu_state
+            device_map_strategy = "balanced"
+            max_memory: Dict[Union[int, str], int] = {device_index: headroom_bytes}
             components = _estimate_component_weights(model_root)
-            if not components:
-                return None
-
             pinned: set[str] = set()
-            remaining = headroom_bytes
-            sorted_components = sorted(components.items(), key=lambda item: (_priority(item[0]), item[1]), reverse=True)
-            for name, weight_bytes in sorted_components:
-                if name == "unet":
-                    pinned.add(name)
-                    remaining -= weight_bytes
-                    continue
-                if weight_bytes <= remaining:
-                    pinned.add(name)
-                    remaining -= weight_bytes
+            offload_targets: set[str] = set()
+            if components:
+                remaining = headroom_bytes
+                sorted_components = sorted(components.items(), key=lambda item: (_priority(item[0]), item[1]), reverse=True)
+                for name, weight_bytes in sorted_components:
+                    if name == "unet":
+                        pinned.add(name)
+                        remaining -= weight_bytes
+                        continue
+                    if weight_bytes <= remaining:
+                        pinned.add(name)
+                        remaining -= weight_bytes
 
-            offload_targets = {name for name in components.keys() if name not in pinned}
-            if enable_disk_offload:
-                device_map = {name: (self.device if name in pinned else "disk") for name in components.keys()}
-            else:
-                device_map = {name: (self.device if name in pinned else "cpu") for name in components.keys()}
+                offload_targets = {name for name in components.keys() if name not in pinned}
 
             _log(
                 "device_map planned "
@@ -242,7 +239,7 @@ class multiviewDiffusionNet:
                 f"gpu_headroom={headroom_bytes / 1024**3:.1f}GiB "
                 f"pinned={sorted(pinned)} offloaded={sorted(offload_targets)}"
             )
-            return device_map
+            return device_map_strategy, max_memory
 
         cfg_path = config.multiview_cfg_path
         custom_pipeline = os.path.join(os.path.dirname(__file__),"..","hunyuanpaintpbr")
@@ -283,7 +280,9 @@ class multiviewDiffusionNet:
             from_pretrained_kwargs["offload_state_dict"] = True
         planned_device_map = _plan_device_map(model_path)
         if planned_device_map is not None:
-            from_pretrained_kwargs["device_map"] = planned_device_map
+            device_map_strategy, max_memory = planned_device_map
+            from_pretrained_kwargs["device_map"] = device_map_strategy
+            from_pretrained_kwargs["max_memory"] = max_memory
         try:
             import transformers
 
@@ -343,17 +342,26 @@ class multiviewDiffusionNet:
                     if planned_device_map is None:
                         raise
                     _log(
-                        "DiffusionPipeline.from_pretrained OOM with planned device_map; "
-                        "retrying with unet pinned and remaining weights offloaded"
+                        "DiffusionPipeline.from_pretrained OOM with balanced device_map; "
+                        "retrying with UNet-only GPU headroom"
                     )
                     fallback_kwargs = dict(from_pretrained_kwargs)
-                    fallback_device_map = {}
-                    for name in planned_device_map.keys():
-                        if name == "unet":
-                            fallback_device_map[name] = self.device
-                        else:
-                            fallback_device_map[name] = "disk" if enable_disk_offload else "cpu"
-                    fallback_kwargs["device_map"] = fallback_device_map
+                    fallback_max_memory = dict(fallback_kwargs.get("max_memory") or {})
+                    gpu_devices = [key for key in fallback_max_memory.keys() if isinstance(key, int)]
+                    if not gpu_devices:
+                        raise
+
+                    gpu_device = gpu_devices[0]
+                    components = _estimate_component_weights(model_path)
+                    unet_weight_bytes = components.get("unet") if components else None
+                    original_budget = int(fallback_max_memory.get(gpu_device, 0))
+                    if unet_weight_bytes is None:
+                        fallback_budget = int(original_budget * 0.6)
+                    else:
+                        fallback_budget = int(unet_weight_bytes + 256 * 1024**2)
+                    fallback_budget = min(original_budget, max(0, fallback_budget))
+                    fallback_max_memory[gpu_device] = fallback_budget
+                    fallback_kwargs["max_memory"] = fallback_max_memory
                     pipeline = DiffusionPipeline.from_pretrained(model_path, **fallback_kwargs)
                 _log("DiffusionPipeline.from_pretrained done")
             finally:
@@ -363,6 +371,7 @@ class multiviewDiffusionNet:
         except TypeError:
             from_pretrained_kwargs.pop("low_cpu_mem_usage", None)
             from_pretrained_kwargs.pop("device_map", None)
+            from_pretrained_kwargs.pop("max_memory", None)
             from_pretrained_kwargs.pop("offload_folder", None)
             from_pretrained_kwargs.pop("offload_state_dict", None)
             _log("DiffusionPipeline.from_pretrained retry without low_cpu_mem_usage")
