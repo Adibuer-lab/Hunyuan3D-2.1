@@ -36,6 +36,30 @@ from .attn_processor import SelfAttnProcessor2_0, RefAttnProcessor2_0, PoseRoPEA
 from transformers import AutoImageProcessor, AutoModel
 
 
+def _memory_debug_enabled() -> bool:
+    return os.getenv("HUNYUAN_MEMORY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _host_mem_summary() -> str:
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        rss = int(psutil.Process(os.getpid()).memory_info().rss)
+        return (
+            f"host_rss={rss / 1024**3:.2f}GiB "
+            f"host_free={int(vm.available) / 1024**3:.2f}GiB "
+            f"host_total={int(vm.total) / 1024**3:.2f}GiB"
+        )
+    except Exception:
+        return "host=unknown"
+
+
+def _log_paint(message: str) -> None:
+    if _memory_debug_enabled():
+        print(f"[hunyuan-paint] {message} {_host_mem_summary()}", flush=True)
+
+
 class Dino_v2(nn.Module):
 
     """Wrapper for DINOv2 vision transformer (frozen weights).
@@ -820,6 +844,7 @@ class UNet2p5DConditionModel(torch.nn.Module):
         val_sched: EulerAncestralDiscreteScheduler = None,
     ) -> None:
         super().__init__()
+        _log_paint("UNet2p5DConditionModel init start")
         self.unet = unet
         self.train_sched = train_sched
         self.val_sched = val_sched
@@ -835,7 +860,9 @@ class UNet2p5DConditionModel(torch.nn.Module):
         self.pbr_token_channels = 77
 
         if self.use_dual_stream and self.use_ra:
+            _log_paint("UNet2p5DConditionModel unet_dual deepcopy start")
             self.unet_dual = copy.deepcopy(unet)
+            _log_paint("UNet2p5DConditionModel unet_dual deepcopy done")
             self.init_attention(self.unet_dual)
 
         self.init_attention(
@@ -847,6 +874,7 @@ class UNet2p5DConditionModel(torch.nn.Module):
             pbr_setting=self.pbr_setting,
         )
         self.init_condition(use_dino=self.use_dino)
+        _log_paint("UNet2p5DConditionModel init done")
 
     @staticmethod
     def from_pretrained(pretrained_model_name_or_path, **kwargs):

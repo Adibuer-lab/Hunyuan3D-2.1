@@ -34,6 +34,30 @@ from diffusers.utils import logging as diffusers_logging
 diffusers_logging.set_verbosity(50)
 
 
+def _memory_debug_enabled() -> bool:
+    return os.getenv("HUNYUAN_MEMORY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _host_mem_summary() -> str:
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        rss = int(psutil.Process(os.getpid()).memory_info().rss)
+        return (
+            f"host_rss={rss / 1024**3:.2f}GiB "
+            f"host_free={int(vm.available) / 1024**3:.2f}GiB "
+            f"host_total={int(vm.total) / 1024**3:.2f}GiB"
+        )
+    except Exception:
+        return "host=unknown"
+
+
+def _log_paint(message: str) -> None:
+    if _memory_debug_enabled():
+        print(f"[hunyuan-paint] {message} {_host_mem_summary()}", flush=True)
+
+
 class Hunyuan3DPaintConfig:
     def __init__(self, max_num_view, resolution):
         self.device = "cuda"
@@ -85,8 +109,12 @@ class Hunyuan3DPaintPipeline:
 
     def load_models(self):
         torch.cuda.empty_cache()
+        _log_paint("paint models: imageSuperNet load start")
         self.models["super_model"] = imageSuperNet(self.config)
+        _log_paint("paint models: imageSuperNet load done")
+        _log_paint("paint models: multiviewDiffusionNet load start")
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
+        _log_paint("paint models: multiviewDiffusionNet load done")
         print("Models Loaded.")
 
     @torch.no_grad()

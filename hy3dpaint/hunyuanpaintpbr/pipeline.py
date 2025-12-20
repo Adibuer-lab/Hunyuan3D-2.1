@@ -12,6 +12,7 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import os
 from typing import Any, Dict, Optional
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
 from diffusers.schedulers import KarrasDiffusionSchedulers
@@ -55,6 +56,30 @@ __all__ = [
     "RefAttnProcessor2_0",
     "PoseRoPEAttnProcessor2_0",
 ]
+
+
+def _memory_debug_enabled() -> bool:
+    return os.getenv("HUNYUAN_MEMORY_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _host_mem_summary() -> str:
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        rss = int(psutil.Process(os.getpid()).memory_info().rss)
+        return (
+            f"host_rss={rss / 1024**3:.2f}GiB "
+            f"host_free={int(vm.available) / 1024**3:.2f}GiB "
+            f"host_total={int(vm.total) / 1024**3:.2f}GiB"
+        )
+    except Exception:
+        return "host=unknown"
+
+
+def _log_paint(message: str) -> None:
+    if _memory_debug_enabled():
+        print(f"[hunyuan-paint] {message} {_host_mem_summary()}", flush=True)
 
 
 def to_rgb_image(maybe_rgba: Image.Image):
@@ -109,7 +134,9 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
         if isinstance(self.unet, UNet2DConditionModel):
+            _log_paint("HunyuanPaintPipeline: wrap UNet2DConditionModel start")
             self.unet = UNet2p5DConditionModel(self.unet, None, self.scheduler)
+            _log_paint("HunyuanPaintPipeline: wrap UNet2DConditionModel done")
 
     def eval(self):
         self.unet.eval()
